@@ -5,14 +5,76 @@ on:
     - cron: "0 14 * * *"   # every day at 14:00 UTC (10:00 New York)
   workflow_dispatch:       # "Run workflow" button for a manual sync
 
-permissions: {}
+permissions:
+  issues: write            # open/close the "Fork sync failed" alert issue
+
+env:
+  GH_REPO: ${{ github.repository }}
+  UPSTREAM: morluto/rea
+  ISSUE_TITLE: Fork sync failed
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Fast-forward main from morluto/rea
-        run: gh repo sync "$GITHUB_REPOSITORY" --branch main
+      - name: Record main before sync
+        id: before
+        run: echo "sha=$(gh api "repos/$GH_REPO/commits/main" --jq .sha)" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Fast-forward main from upstream
+        run: gh repo sync "$GH_REPO" --branch main
         env:
           # Fine-grained token for this repo only: Contents + Workflows read/write
           GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Write run summary
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ steps.before.outputs.sha }}
+        run: |
+          after=$(gh api "repos/$GH_REPO/commits/main" --jq .sha)
+          upstream=$(gh api "repos/$UPSTREAM/commits/main" --jq .sha)
+          synced=0
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != "$after" ]; then
+            synced=$(gh api "repos/$GH_REPO/compare/$BEFORE...$after" --jq .total_commits)
+          fi
+          if [ "$after" = "$upstream" ]; then status="✅ In sync"; else status="❌ Not in sync"; fi
+          {
+            echo "## $status"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commits synced this run | $synced |"
+            echo "| main before | \`${BEFORE:0:7}\` |"
+            echo "| main after | \`${after:0:7}\` |"
+            echo "| $UPSTREAM main | \`${upstream:0:7}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or update alert issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=$(gh issue list --state open --search "in:title \"$ISSUE_TITLE\"" --json number --jq '.[0].number // empty')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --body "Failed again on $(date -u '+%Y-%m-%d %H:%M UTC'): $RUN_URL"
+          else
+            gh issue create --title "$ISSUE_TITLE" --body "The daily sync of \`main\` from $UPSTREAM failed on $(date -u '+%Y-%m-%d %H:%M UTC').
+
+          Log: $RUN_URL
+
+          Common causes: \`SYNC_TOKEN\` expired, or \`main\` has commits that $UPSTREAM doesn't have.
+          This issue closes itself after the next successful sync."
+          fi
+
+      - name: Close alert issue after recovery
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for n in $(gh issue list --state open --search "in:title \"$ISSUE_TITLE\"" --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Sync is working again: $RUN_URL"
+          done
